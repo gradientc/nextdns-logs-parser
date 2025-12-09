@@ -159,12 +159,13 @@ def analyse_logs(lf: pl.LazyFrame) -> dict:
         "device_stats": device_stats,
     }
 
-    _add_secondary_stats(stats, df, total_queries)
+    secondary_stats = _add_secondary_stats(df, total_queries)
+    stats.update(secondary_stats)
 
     return stats
 
 
-def _analyze_block_reasons(blocked_df):
+def _analyze_block_reasons(blocked_df: pl.LazyFrame) -> pl.LazyFrame:
     """
     block reasons breakdown - need to explode the comma-separated list
     """
@@ -181,7 +182,7 @@ def _analyze_block_reasons(blocked_df):
     )
 
 
-def _get_top_block_reasons(reasons_df):
+def _get_top_block_reasons(reasons_df: pl.LazyFrame) -> list[dict]:
     """
     top block reasons
     """
@@ -194,7 +195,7 @@ def _get_top_block_reasons(reasons_df):
     )
 
 
-def _get_domain_reason_map(reasons_df):
+def _get_domain_reason_map(reasons_df: pl.LazyFrame) -> list[dict]:
     """
     domain to reason mapping - which domains got blocked by what
     """
@@ -207,24 +208,26 @@ def _get_domain_reason_map(reasons_df):
     )
 
 
-def _analyze_threats(top_block_reasons):
+def _analyze_threats(top_block_reasons: list[dict]) -> list[dict]:
     """
     security threats - anything matching our scary keywords
     """
     threat_reasons = []
     for item in top_block_reasons:
-        reason_lower = item["reason"].lower()
+        reason_lower = item.get("reason", "").lower()
         if any(keyword in reason_lower for keyword in SECURITY_KEYWORDS):
             threat_reasons.append(item)
     return threat_reasons
 
 
-def _add_secondary_stats(stats, df, total_queries):
+def _add_secondary_stats(df: pl.DataFrame, total_queries: int) -> dict:
     """
     Add secondary stats like country, protocol, etc.
     """
+    secondary_stats = {}
+
     # country breakdown for the map
-    stats["country_stats"] = (
+    secondary_stats["country_stats"] = (
         df.filter(pl.col("destination_country").is_not_null())
         .group_by("destination_country")
         .agg(pl.len().alias("count"))
@@ -233,7 +236,7 @@ def _add_secondary_stats(stats, df, total_queries):
     )
 
     # protocol distribution (DoH vs DoT etc)
-    stats["protocol_stats"] = (
+    secondary_stats["protocol_stats"] = (
         df.filter(pl.col("protocol").is_not_null())
         .group_by("protocol")
         .agg(pl.len().alias("count"))
@@ -242,7 +245,7 @@ def _add_secondary_stats(stats, df, total_queries):
     )
 
     # query type breakdown
-    stats["query_type_stats"] = (
+    secondary_stats["query_type_stats"] = (
         df.filter(pl.col("query_type").is_not_null())
         .group_by("query_type")
         .agg(pl.len().alias("count"))
@@ -251,13 +254,13 @@ def _add_secondary_stats(stats, df, total_queries):
     )
 
     # DNSSEC adoption
-    dnssec_count = df.filter(pl.col("dnssec").is_in([True])).height
-    stats["dnssec_rate"] = (
+    dnssec_count = df.filter(pl.col("dnssec").eq(True)).height
+    secondary_stats["dnssec_rate"] = (
         (dnssec_count / total_queries * 100) if total_queries > 0 else 0
     )
 
     # hourly activity pattern
-    stats["hourly_stats"] = (
+    secondary_stats["hourly_stats"] = (
         df.with_columns(pl.col("timestamp").dt.hour().alias("hour"))
         .group_by("hour")
         .agg(pl.len().alias("count"))
@@ -266,7 +269,7 @@ def _add_secondary_stats(stats, df, total_queries):
     )
 
     # daily volume over time
-    stats["daily_stats"] = (
+    secondary_stats["daily_stats"] = (
         df.with_columns(pl.col("timestamp").dt.date().alias("date"))
         .group_by("date")
         .agg(
@@ -276,6 +279,8 @@ def _add_secondary_stats(stats, df, total_queries):
         .sort("date")
         .to_dicts()
     )
+
+    return secondary_stats
 
 
 def generate_text_report(stats: dict, output_path: Path):
