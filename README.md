@@ -1,5 +1,5 @@
 # **NextDNS Logs Parser**
-
+![header with screenshot](img/header-nextdnslogsparser.webp?raw=true)
 Here's a script I put together to handle NextDNS log exports.
 
 If you've ever tried to open a 2GB+ CSV file in Excel, you know it usually ends in tears (and sometimes a crashed PC). 
