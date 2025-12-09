@@ -10,6 +10,7 @@ import argparse
 import glob
 import html
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -88,7 +89,9 @@ def analyse_logs(lf: pl.LazyFrame) -> dict:
     # --- blocked traffic analysis ---
     blocked_df = df.filter(pl.col("status") == "blocked")
     total_blocked = len(blocked_df)
-    block_rate = (total_blocked / total_queries * 100) if total_queries > 0 else 0
+    block_rate = (
+        (total_blocked / total_queries * 100) if total_queries > 0 else 0
+    )
 
     # top blocked domains
     top_blocked_domains = (
@@ -99,43 +102,10 @@ def analyse_logs(lf: pl.LazyFrame) -> dict:
         .to_dicts()
     )
 
-    # block reasons breakdown - need to explode the comma-separated list
-    reasons_df = (
-        blocked_df.select("domain", "reasons")
-        .filter(pl.col("reasons").is_not_null())
-        .with_columns(
-            pl.col("reasons").str.split(",").alias("reason_list")
-        )
-        .explode("reason_list")
-        .with_columns(
-            pl.col("reason_list").str.strip_chars().alias("reason")
-        )
-    )
-
-    # top block reasons
-    top_block_reasons = (
-        reasons_df.group_by("reason")
-        .agg(pl.len().alias("count"))
-        .sort("count", descending=True)
-        .head(TOP_N)
-        .to_dicts()
-    )
-
-    # domain to reason mapping - which domains got blocked by what
-    domain_reason_map = (
-        reasons_df.group_by("domain", "reason")
-        .agg(pl.len().alias("count"))
-        .sort("count", descending=True)
-        .head(50)  # top 50 domain-reason combos
-        .to_dicts()
-    )
-
-    # security threats - anything matching our scary keywords
-    threat_reasons = []
-    for item in top_block_reasons:
-        reason_lower = item["reason"].lower()
-        if any(keyword in reason_lower for keyword in SECURITY_KEYWORDS):
-            threat_reasons.append(item)
+    reasons_df = _analyze_block_reasons(blocked_df)
+    top_block_reasons = _get_top_block_reasons(reasons_df)
+    domain_reason_map = _get_domain_reason_map(reasons_df)
+    threat_reasons = _analyze_threats(top_block_reasons)
 
     # --- general traffic stats ---
 
@@ -174,59 +144,7 @@ def analyse_logs(lf: pl.LazyFrame) -> dict:
         .to_dicts()
     )
 
-    # country breakdown for the map
-    country_stats = (
-        df.filter(pl.col("destination_country").is_not_null())
-        .group_by("destination_country")
-        .agg(pl.len().alias("count"))
-        .sort("count", descending=True)
-        .to_dicts()
-    )
-
-    # protocol distribution (DoH vs DoT etc)
-    protocol_stats = (
-        df.filter(pl.col("protocol").is_not_null())
-        .group_by("protocol")
-        .agg(pl.len().alias("count"))
-        .sort("count", descending=True)
-        .to_dicts()
-    )
-
-    # query type breakdown
-    query_type_stats = (
-        df.filter(pl.col("query_type").is_not_null())
-        .group_by("query_type")
-        .agg(pl.len().alias("count"))
-        .sort("count", descending=True)
-        .to_dicts()
-    )
-
-    # DNSSEC adoption
-    dnssec_count = df.filter(pl.col("dnssec") == True).height
-    dnssec_rate = (dnssec_count / total_queries * 100) if total_queries > 0 else 0
-
-    # hourly activity pattern
-    hourly_stats = (
-        df.with_columns(pl.col("timestamp").dt.hour().alias("hour"))
-        .group_by("hour")
-        .agg(pl.len().alias("count"))
-        .sort("hour")
-        .to_dicts()
-    )
-
-    # daily volume over time
-    daily_stats = (
-        df.with_columns(pl.col("timestamp").dt.date().alias("date"))
-        .group_by("date")
-        .agg(
-            pl.len().alias("total"),
-            (pl.col("status") == "blocked").sum().alias("blocked")
-        )
-        .sort("date")
-        .to_dicts()
-    )
-
-    return {
+    stats = {
         "total_queries": total_queries,
         "total_blocked": total_blocked,
         "block_rate": block_rate,
@@ -239,13 +157,130 @@ def analyse_logs(lf: pl.LazyFrame) -> dict:
         "domain_reason_map": domain_reason_map,
         "threat_reasons": threat_reasons,
         "device_stats": device_stats,
-        "country_stats": country_stats,
-        "protocol_stats": protocol_stats,
-        "query_type_stats": query_type_stats,
-        "dnssec_rate": dnssec_rate,
-        "hourly_stats": hourly_stats,
-        "daily_stats": daily_stats,
     }
+
+    secondary_stats = _add_secondary_stats(df, total_queries)
+    stats.update(secondary_stats)
+
+    return stats
+
+
+def _analyze_block_reasons(blocked_df: pl.LazyFrame) -> pl.LazyFrame:
+    """
+    block reasons breakdown - need to explode the comma-separated list
+    """
+    return (
+        blocked_df.select("domain", "reasons")
+        .filter(pl.col("reasons").is_not_null())
+        .with_columns(
+            pl.col("reasons").str.split(",").alias("reason_list")
+        )
+        .explode("reason_list")
+        .with_columns(
+            pl.col("reason_list").str.strip_chars().alias("reason")
+        )
+    )
+
+
+def _get_top_block_reasons(reasons_df: pl.LazyFrame) -> list[dict]:
+    """
+    top block reasons
+    """
+    return (
+        reasons_df.group_by("reason")
+        .agg(pl.len().alias("count"))
+        .sort("count", descending=True)
+        .head(TOP_N)
+        .to_dicts()
+    )
+
+
+def _get_domain_reason_map(reasons_df: pl.LazyFrame) -> list[dict]:
+    """
+    domain to reason mapping - which domains got blocked by what
+    """
+    return (
+        reasons_df.group_by("domain", "reason")
+        .agg(pl.len().alias("count"))
+        .sort("count", descending=True)
+        .head(50)  # top 50 domain-reason combos
+        .to_dicts()
+    )
+
+
+def _analyze_threats(top_block_reasons: list[dict]) -> list[dict]:
+    """
+    security threats - anything matching our scary keywords
+    """
+    threat_reasons = []
+    for item in top_block_reasons:
+        reason_lower = item.get("reason", "").lower()
+        if any(keyword in reason_lower for keyword in SECURITY_KEYWORDS):
+            threat_reasons.append(item)
+    return threat_reasons
+
+
+def _add_secondary_stats(df: pl.DataFrame, total_queries: int) -> dict:
+    """
+    Add secondary stats like country, protocol, etc.
+    """
+    secondary_stats = {}
+
+    # country breakdown for the map
+    secondary_stats["country_stats"] = (
+        df.filter(pl.col("destination_country").is_not_null())
+        .group_by("destination_country")
+        .agg(pl.len().alias("count"))
+        .sort("count", descending=True)
+        .to_dicts()
+    )
+
+    # protocol distribution (DoH vs DoT etc)
+    secondary_stats["protocol_stats"] = (
+        df.filter(pl.col("protocol").is_not_null())
+        .group_by("protocol")
+        .agg(pl.len().alias("count"))
+        .sort("count", descending=True)
+        .to_dicts()
+    )
+
+    # query type breakdown
+    secondary_stats["query_type_stats"] = (
+        df.filter(pl.col("query_type").is_not_null())
+        .group_by("query_type")
+        .agg(pl.len().alias("count"))
+        .sort("count", descending=True)
+        .to_dicts()
+    )
+
+    # DNSSEC adoption
+    dnssec_count = df.filter(pl.col("dnssec").eq(True)).height
+    secondary_stats["dnssec_rate"] = (
+        (dnssec_count / total_queries * 100) if total_queries > 0 else 0
+    )
+
+    # hourly activity pattern
+    secondary_stats["hourly_stats"] = (
+        df.with_columns(pl.col("timestamp").dt.hour().alias("hour"))
+        .group_by("hour")
+        .agg(pl.len().alias("count"))
+        .sort("hour")
+        .to_dicts()
+    )
+
+    # daily volume over time
+    secondary_stats["daily_stats"] = (
+        df.with_columns(pl.col("timestamp").dt.date().alias("date"))
+        .group_by("date")
+        .agg(
+            pl.len().alias("total"),
+            (pl.col("status") == "blocked").sum().alias("blocked")
+        )
+        .sort("date")
+        .to_dicts()
+    )
+
+    return secondary_stats
 
 
 def generate_text_report(stats: dict, output_path: Path):
@@ -262,7 +297,8 @@ def generate_text_report(stats: dict, output_path: Path):
     w(f"Date Range: {stats['date_start']} to {stats['date_end']}")
     w(f"Generated: {datetime.now(timezone.utc).isoformat()}")
     w(f"Total Queries: {stats['total_queries']:,}")
-    w(f"Total Blocked: {stats['total_blocked']:,} ({stats['block_rate']:.1f}%)")
+    w(f"Total Blocked: {stats['total_blocked']:,} "
+      f"({stats['block_rate']:.1f}%)")
     w("=" * 80)
     w()
 
@@ -304,7 +340,8 @@ def generate_text_report(stats: dict, output_path: Path):
     w(f"TOP {TOP_N} DEVICES")
     w("-" * 40)
     for item in stats["device_stats"]:
-        w(f"  {item['total']:>8,} queries ({item['block_rate']:>5.1f}% blocked) -- {item['device_name']}")
+        w(f"  {item['total']:>8,} queries "
+          f"({item['block_rate']:>5.1f}% blocked) -- {item['device_name']}")
     w()
 
     # country breakdown
@@ -341,10 +378,16 @@ def generate_html_report(stats: dict, output_path: Path):
     hourly_labels = [f"{d['hour']:02d}:00" for d in stats["hourly_stats"]]
     hourly_counts = [d["count"] for d in stats["hourly_stats"]]
 
-    country_data = {d["destination_country"]: d["count"] for d in stats["country_stats"]}
+    country_data = {
+        d["destination_country"]: d["count"] for d in stats["country_stats"]
+    }
 
-    block_reason_labels = [d["reason"][:30] for d in stats["top_block_reasons"][:10]]
-    block_reason_counts = [d["count"] for d in stats["top_block_reasons"][:10]]
+    block_reason_labels = [
+        d["reason"][:30] for d in stats["top_block_reasons"][:10]
+    ]
+    block_reason_counts = [
+        d["count"] for d in stats["top_block_reasons"][:10]
+    ]
 
     # escape helper for safety
     def esc(s):
@@ -353,7 +396,7 @@ def generate_html_report(stats: dict, output_path: Path):
     # the threat status determines the alert colour
     has_threats = len(stats["threat_reasons"]) > 0
 
-    html_content = f'''<!DOCTYPE html>
+    html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -361,8 +404,10 @@ def generate_html_report(stats: dict, output_path: Path):
     <title>NextDNS Report - {stats["date_start"]} to {stats["date_end"]}</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jsvectormap"></script>
-    <script src="https://cdn.jsdelivr.net/npm/jsvectormap/dist/maps/world.js"></script>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/jsvectormap/dist/css/jsvectormap.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/jsvectormap/dist/maps/world.js">
+    </script>
+    <link rel="stylesheet"
+          href="https://cdn.jsdelivr.net/npm/jsvectormap/dist/css/jsvectormap.min.css">
     <style>
         :root {{
             --bg-primary: #0a0a0f;
@@ -407,7 +452,8 @@ def generate_html_report(stats: dict, output_path: Path):
         header h1 {{
             font-size: 2.5rem;
             font-weight: 700;
-            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+            background: linear-gradient(135deg, var(--accent-blue),
+                                      var(--accent-purple));
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
@@ -438,7 +484,8 @@ def generate_html_report(stats: dict, output_path: Path):
         .stat-card .value {{
             font-size: 2rem;
             font-weight: 700;
-            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+            background: linear-gradient(135deg, var(--accent-blue),
+                                      var(--accent-purple));
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
@@ -473,12 +520,15 @@ def generate_html_report(stats: dict, output_path: Path):
         }}
 
         .threat-card {{
-            border-color: {("var(--accent-red)" if has_threats else "var(--accent-green)")};
-            background: {("rgba(239, 68, 68, 0.1)" if has_threats else "rgba(16, 185, 129, 0.1)")};
+            border-color: {("var(--accent-red)" if has_threats
+                            else "var(--accent-green)")};
+            background: {("rgba(239, 68, 68, 0.1)" if has_threats
+                          else "rgba(16, 185, 129, 0.1)")};
         }}
 
         .threat-card h2 {{
-            color: {("var(--accent-red)" if has_threats else "var(--accent-green)")};
+            color: {("var(--accent-red)" if has_threats
+                     else "var(--accent-green)")};
         }}
 
         .grid-2 {{
@@ -560,7 +610,8 @@ def generate_html_report(stats: dict, output_path: Path):
 
         .progress-bar .fill {{
             height: 100%;
-            background: linear-gradient(90deg, var(--accent-blue), var(--accent-purple));
+            background: linear-gradient(90deg, var(--accent-blue),
+                                      var(--accent-purple));
             border-radius: 4px;
         }}
 
@@ -639,7 +690,13 @@ def generate_html_report(stats: dict, output_path: Path):
 
         <div class="card threat-card">
             <h2>{"Security Threats Detected" if has_threats else "No Security Threats"}</h2>
-            {"<table><thead><tr><th>Threat Type</th><th>Blocks</th></tr></thead><tbody>" + "".join(f'<tr><td>{esc(t["reason"])}</td><td class="count">{t["count"]:,}</td></tr>' for t in stats["threat_reasons"]) + "</tbody></table>" if has_threats else "<p>All clear - no security-related blocks detected in this period.</p>"}
+            {
+                "<table><thead><tr><th>Threat Type</th><th>Blocks</th></tr></thead><tbody>" +
+                "".join(f'<tr><td>{esc(t["reason"])}</td><td class="count">{t["count"]:,}</td></tr>'
+                        for t in stats["threat_reasons"]) + "</tbody></table>"
+                if has_threats else
+                "<p>All clear - no security-related blocks detected in this period.</p>"
+            }
         </div>
 
         <div class="grid-2">
@@ -676,7 +733,10 @@ def generate_html_report(stats: dict, output_path: Path):
                         <tr><th>Domain</th><th>Reasons</th><th>Count</th></tr>
                     </thead>
                     <tbody>
-                        {"".join(_generate_blocked_domain_row(d, stats["domain_reason_map"]) for d in stats["top_blocked_domains"][:15])}
+                    {"".join(
+                        _generate_blocked_domain_row(d, stats["domain_reason_map"])
+                        for d in stats["top_blocked_domains"][:15]
+                    )}
                     </tbody>
                 </table>
             </div>
@@ -688,7 +748,11 @@ def generate_html_report(stats: dict, output_path: Path):
                 <table>
                     <thead><tr><th>Domain</th><th>Count</th></tr></thead>
                     <tbody>
-                        {"".join(f'<tr><td class="domain">{esc(d["domain"])}</td><td class="count">{d["count"]:,}</td></tr>' for d in stats["top_domains"][:12])}
+                        {"".join(
+                            f'<tr><td class="domain">{esc(d["domain"])}</td>'
+                            f'<td class="count">{d["count"]:,}</td></tr>'
+                            for d in stats["top_domains"][:12]
+                        )}
                     </tbody>
                 </table>
             </div>
@@ -697,7 +761,11 @@ def generate_html_report(stats: dict, output_path: Path):
                 <table>
                     <thead><tr><th>Service</th><th>Count</th></tr></thead>
                     <tbody>
-                        {"".join(f'<tr><td class="domain">{esc(d["root_domain"])}</td><td class="count">{d["count"]:,}</td></tr>' for d in stats["top_root_domains"][:12])}
+                        {"".join(
+                            f'<tr><td class="domain">{esc(d["root_domain"])}</td>'
+                            f'<td class="count">{d["count"]:,}</td></tr>'
+                            for d in stats["top_root_domains"][:12]
+                        )}
                     </tbody>
                 </table>
             </div>
@@ -706,7 +774,11 @@ def generate_html_report(stats: dict, output_path: Path):
                 <table>
                     <thead><tr><th>Protocol</th><th>Count</th></tr></thead>
                     <tbody>
-                        {"".join(f'<tr><td>{esc(d["protocol"])}</td><td class="count">{d["count"]:,}</td></tr>' for d in stats["protocol_stats"])}
+                        {"".join(
+                            f'<tr><td>{esc(d["protocol"])}</td>'
+                            f'<td class="count">{d["count"]:,}</td></tr>'
+                            for d in stats["protocol_stats"]
+                        )}
                     </tbody>
                 </table>
             </div>
@@ -714,7 +786,8 @@ def generate_html_report(stats: dict, output_path: Path):
 
         <div class="card">
             <h2>Devices</h2>
-            {"".join(_generate_device_row(d, stats["total_queries"]) for d in stats["device_stats"])}
+            {"".join(_generate_device_row(d, stats["total_queries"])
+                     for d in stats["device_stats"])}
         </div>
 
         <footer>
@@ -843,7 +916,7 @@ def generate_html_report(stats: dict, output_path: Path):
         }});
     </script>
 </body>
-</html>'''
+</html>"""
 
     output_path.write_text(html_content, encoding="utf-8")
 
@@ -920,4 +993,4 @@ def main():
 
 
 if __name__ == "__main__":
-    exit(main())
+    sys.exit(main())
