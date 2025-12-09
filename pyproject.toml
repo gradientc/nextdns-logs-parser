@@ -1,0 +1,13 @@
+[project]
+name = "nextdns-logs-parser"
+version = "0.0.1"
+description = "Parse NextDNS CSV log exports into comprehensive reports"
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+requires-python = ">=3.10"
+dependencies = [
+    "polars>=1.0.0",
+]
+
+[project.scripts]
+nextdns-logs-parser = "nextdns-logs-parser:main"
