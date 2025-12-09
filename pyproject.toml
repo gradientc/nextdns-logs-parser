@@ -10,4 +10,4 @@ dependencies = [
 ]
 
 [project.scripts]
-nextdns-logs-parser = "nextdns-logs-parser:main"
+nextdns-logs-parser = "nextdns_logs_parser:main"

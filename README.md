@@ -23,10 +23,10 @@ It's not an official NextDNS project ; merely a tool to help parse those massive
 
 3. Run the thing:  
    Drop your CSV in the same folder and run:  
-   `python nextdns-logs-parser.py`
+    `python nextdns_logs_parser.py`
 
    It'll find the CSV automatically. If you want to be specific or change the output format:  
-   `python nextdns-logs-parser.py \--input my-logs.csv \--format txt`
+    `python nextdns_logs_parser.py \--input my-logs.csv \--format txt`
 
 ## **Disclaimer (The boring bit)**
 
